@@ -24,15 +24,21 @@ from colossalai.inference.modeling.policy import model_policy_map
 from colossalai.inference.sampler import search_tokens
 from colossalai.inference.spec import Drafter, GlideInput
 from colossalai.inference.struct import Sequence
-from colossalai.inference.utils import get_model_size, has_index_file
+from colossalai.inference.utils import get_model_size
 from colossalai.interface import ModelWrapper
-from colossalai.lazy import LazyInitContext
 from colossalai.logging import get_dist_logger
 from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.shardformer import ShardConfig, ShardFormer
 from colossalai.shardformer.policies.base_policy import Policy
-
+from .hybrid_parallel_inference_plugin import HybridParallelInferencePlugin
 from .request_handler import RequestHandler
+from colossalai.legacy.engine.schedule import (
+    BaseSchedule,
+    InterleavedPipelineSchedule,
+    NonPipelineSchedule,
+    PipelineSchedule,
+)
+from .hybrid_parallel_inference_plugin import HybridParallelInferencePlugin
 
 __all__ = ["InferenceEngine"]
 
@@ -64,18 +70,27 @@ class InferenceEngine:
         model_or_path: Union[nn.Module, str],
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         inference_config: InferenceConfig,
+        model_config: AutoConfig,
         verbose: bool = False,
         model_policy: Union[Policy, Type[Policy]] = None,
+        schedule: Optional[BaseSchedule] = None,
+        hybrid_inference: HybridParallelInferencePlugin = None,
+        hybrid_model: nn.Module = None,
+        tp_size: int = 1,
+        pp_size: int = 1,
     ) -> None:
         self.inference_config = inference_config
         self.dtype = inference_config.dtype
         self.high_precision = inference_config.high_precision
+        self.schedule = schedule
+        self.hybrid_model = hybrid_model
 
         self.verbose = verbose
         self.logger = get_dist_logger(__name__)
         self.model_shard_infer_config = inference_config.to_model_shard_inference_config()
-
-        self.init_model(model_or_path, model_policy, self.model_shard_infer_config)
+        self.model_config = model_config
+        # self.init_model(model_or_path, model_policy, self.model_shard_infer_config)
+        self.hybrid_inference = hybrid_inference#HybridParallelInferencePlugin(tp_size, pp_size)
 
         self.generation_config = inference_config.to_generation_config(self.model_config)
         self.generation_config_dict = self.generation_config.to_dict()
@@ -106,7 +121,7 @@ class InferenceEngine:
         self.use_glide = False
         self.n_spec_tokens = self.inference_config.max_n_spec_tokens
 
-        self._verify_args()
+        # self._verify_args()
 
     def init_model(
         self,
@@ -123,24 +138,16 @@ class InferenceEngine:
             model_inference_config: the configuration for modeling initialization when inference.
             model_shard_infer_config (ModelShardInferenceConfig): the configuration for init of module when inference.
         """
-        pretrained_path = None
-        if isinstance(model_or_path, str):
-            import colossalai.interface.pretrained as pretrained_utils
 
+        if isinstance(model_or_path, str):
             try:
-                hf_config = AutoConfig.from_pretrained(model_or_path, trust_remote_code=True, torch_dtype=self.dtype)
+                hf_config = AutoConfig.from_pretrained(model_or_path, trust_remote_code=True)
                 arch = getattr(hf_config, "architectures")[0]
                 if arch in _supported_models.keys():
-                    if arch is "BaichuanForCausalLM":
-                        self.logger.warning(
-                            "Attention ! We use lazy init by default, which could be faster for model loading. For baichuan model, the output maybe have a slight difference with transformers"
-                        )
-                    ctx = LazyInitContext(default_device="cuda")
-                    with ctx:
-                        model = _supported_models[arch].from_pretrained(
-                            model_or_path, trust_remote_code=True, torch_dtype=self.dtype
-                        )
-                    pretrained_path = pretrained_utils.get_pretrained_path(model)
+                    # NOTE(lry89757) Currently we load the model using transformers-api,
+                    # but we will use lazy tensor and checkpoint io to accelerate
+                    # the model load process in the future.
+                    model = _supported_models[arch].from_pretrained(model_or_path, trust_remote_code=True)
                 else:
                     # TODO(char-1ee): if the model not supported, use transformers APIs to load and generate
                     raise ValueError(f"Model {arch} is not supported.")
@@ -198,13 +205,14 @@ class InferenceEngine:
                 f"After the shard, Rank: [{dist.get_rank()}], model size: {get_model_size(self.model)} GB, model's device is: {model.device}"
             )
 
-        if pretrained_path:
-            from colossalai.inference.core.plugin import InferCheckpoint_io
+        # NOTE(lry89757) Deprecated currently, will reused when introduce lazy tensor
+        # if isinstance(model_or_path, str) and not isinstance(casuallm, AutoModelForCausalLM):
+        #     from colossalai.inference.core.plugin import InferCheckpoint_io
 
-            cpt_io = InferCheckpoint_io()
-            if_has_index_file, model_index_file = has_index_file(pretrained_path)
-            assert if_has_index_file, "the model path is invalid"
-            cpt_io.load_model(self.model, model_index_file)
+        #     cpt_io = InferCheckpoint_io()
+        #     if_has_index_file, model_index_file = has_index_file(model_or_path)
+        #     assert if_has_index_file, "the model path is invalid"
+        #     cpt_io.load_model(self.model, model_index_file)
 
         free_gpu_memory, _ = torch.cuda.mem_get_info()
         peak_memory = init_gpu_memory - free_gpu_memory
@@ -776,8 +784,11 @@ class InferenceEngine:
         if input_meta_data.use_cuda_graph:
             model_executable = self.graph_runners[input_meta_data.batch_size]
         else:
-            model_executable = self.model
+            model_executable = self.hybrid_model
 
+        batch_input = {"input_token_ids": input_token_ids, "output_tensor": output_tensor, "input_meta_data": input_meta_data}
+        outputs = self.hybrid_inference.execute_pipeline(batch_input, self.hybrid_model, None, False, return_outputs=True)
+        print(outputs)
         # TODO: padding_id is used for generating attn_mask and will be removed if nopad version is supported.
         logits = model_executable(input_token_ids, output_tensor, input_meta_data, self.k_cache, self.v_cache)
         if self.inference_config.pad_input:
