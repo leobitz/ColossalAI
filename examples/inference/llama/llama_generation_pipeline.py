@@ -88,6 +88,7 @@ def infer(args):
     )
     # print("Microbatches ", args.mbs)
     model_shard_infer_config = inference_config.to_model_shard_inference_config()
+    policy = POLICY_CLS()
     plugin = HybridParallelInferencePlugin(args.tp_size, args.pp_size,
             # zero_stage=args.zero,
             # sp_size=args.sp,
@@ -99,7 +100,7 @@ def infer(args):
             precision="bf16",
             dp_outside=False,
             sharding_extra_kwargs={"model_shard_infer_config": model_shard_infer_config},
-            custom_policy=POLICY_CLS())
+            custom_policy=policy)
     init_ctx = (
         LazyInitContext(default_device=get_accelerator().get_current_device())
         if isinstance(plugin, (HybridParallelInferencePlugin,))
