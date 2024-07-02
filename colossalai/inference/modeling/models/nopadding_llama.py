@@ -132,7 +132,7 @@ def llama_model_forward(
     norm_output = torch.empty_like(hidden_states)
     tokens_to_verify = inputmetadata.num_tokens_to_verify if inputmetadata.use_spec_dec else None
     residual = None
-
+    
     for layer_id, decoder_layer in enumerate(self.layers):
         hidden_states, residual = decoder_layer(
             hidden_states,

@@ -786,7 +786,12 @@ class InferenceEngine:
         else:
             model_executable = self.hybrid_model
 
-        batch_input = {"input_token_ids": input_token_ids, "output_tensor": output_tensor, "input_meta_data": input_meta_data}
+        batch_input = {
+                        "input_tokens_ids": input_token_ids, 
+                        "output_tensor": output_tensor, 
+                        "inputmetadata": input_meta_data,
+                        "k_caches": self.k_cache,
+                        "v_caches": self.v_cache}
         outputs = self.hybrid_inference.execute_pipeline(batch_input, self.hybrid_model, None, False, return_outputs=True)
         print(outputs)
         # TODO: padding_id is used for generating attn_mask and will be removed if nopad version is supported.
