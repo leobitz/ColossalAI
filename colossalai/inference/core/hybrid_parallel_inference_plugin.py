@@ -433,7 +433,7 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
                 num_model_chunks=num_model_chunks,
                 num_layers_per_stage=num_layers_per_stage,
             )
-            self.custom_policy.pipeline_stage_manager = self.stage_manager
+            
             if pp_style == "interleaved":
                 # assert num_model_chunks > 1, "number of model chunks must be > 1 when using interleaved"
                 # self.schedule = InterleavedSchedule(
@@ -479,6 +479,8 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
             gradient_checkpoint_config=gradient_checkpoint_config,
             extra_kwargs=sharding_extra_kwargs,
         )
+        if self.custom_policy is not None:
+            self.custom_policy.set_shard_config(self.shard_config)
         self.amp_config = dict(
             initial_scale=initial_scale,
             growth_factor=growth_factor,
