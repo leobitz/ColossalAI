@@ -175,7 +175,6 @@ def llama_model_forward_pp(
     v_caches: List[torch.Tensor] = None,
     use_cuda_kernel: Optional[bool] = True,
     high_precision: bool = False,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
     hidden_states: Optional[torch.FloatTensor] = None,
     stage_manager: Optional[PipelineStageManager] = None,
     stage_index: Optional[List[int]] = None,
@@ -201,23 +200,11 @@ def llama_model_forward_pp(
 
     # retrieve input_ids and inputs_embeds
     if stage_manager.is_first_stage():
-        if input_tokens_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_tokens_ids is not None:
-            batch_size, seq_length = input_tokens_ids.shape[:2]
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape[:2]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
-        device = input_tokens_ids.device if input_tokens_ids is not None else inputs_embeds.device
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_tokens_ids)
+        inputs_embeds = self.embed_tokens(input_tokens_ids)
 
         hidden_states = inputs_embeds
     else:
         input_shape = hidden_states.shape[:-1]
-        batch_size, seq_length = input_shape
-        device = hidden_states.device
         
     # hidden_states = self.embed_tokens(input_tokens_ids)
 
@@ -257,8 +244,8 @@ def llama_model_forward_pp(
     norm_output = torch.empty_like(hidden_states)
     tokens_to_verify = inputmetadata.num_tokens_to_verify if inputmetadata.use_spec_dec else None
     residual = None
-
-    for layer_id, decoder_layer in enumerate(self.layers):
+    start_idx, end_idx = stage_index[0], stage_index[1]
+    for layer_id, decoder_layer in enumerate(self.layers[start_idx:end_idx], start=start_idx):
         hidden_states, residual = decoder_layer(
             hidden_states,
             residual=residual,

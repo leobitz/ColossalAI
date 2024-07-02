@@ -791,7 +791,11 @@ class InferenceEngine:
                         "output_tensor": output_tensor, 
                         "inputmetadata": input_meta_data,
                         "k_caches": self.k_cache,
-                        "v_caches": self.v_cache}
+                        "v_caches": self.v_cache,
+                        "stage_manager": self.hybrid_inference.stage_manager,
+                        "hidden_states": None,
+                        "stage_index": None
+                        }
         outputs = self.hybrid_inference.execute_pipeline(batch_input, self.hybrid_model, None, False, return_outputs=True)
         print(outputs)
         # TODO: padding_id is used for generating attn_mask and will be removed if nopad version is supported.

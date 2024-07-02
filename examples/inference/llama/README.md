@@ -12,6 +12,10 @@ Run multi-GPU inference (Tensor Parallelism), as in the following example using 
 colossalai run --nproc_per_node 2 llama_generation.py -m PATH_MODEL --max_length 128 --tp_size 2
 ```
 
+```bash
+colossalai run --nproc_per_node 4 llama_generation_pipeline.py -m meta-llama/Meta-Llama-3-8B --max_length 128 --tp_size 2 --pp_size 2
+```
+
 ## Run Speculative Decoding
 
 Colossal-Inference supports speculative decoding using the inference engine, with optimized kernels and cache management for the main model.
