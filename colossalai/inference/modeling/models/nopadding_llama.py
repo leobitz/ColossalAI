@@ -27,6 +27,7 @@ from colossalai.logging import get_dist_logger
 from colossalai.shardformer.layer.parallel_module import ParallelModule
 from colossalai.tensor.d_tensor import distribute_tensor, is_distributed_tensor
 
+from colossalai.pipeline.stage_manager import PipelineStageManager
 inference_ops = InferenceOpsLoader().load()
 
 logger = get_dist_logger(__name__)
@@ -165,6 +166,176 @@ def llama_model_forward(
     return hidden_states
 
 
+def llama_model_forward_pp(
+    self: LlamaModel,
+    input_tokens_ids: torch.Tensor,
+    output_tensor: torch.Tensor,
+    inputmetadata: InputMetaData,
+    k_caches: List[torch.Tensor] = None,
+    v_caches: List[torch.Tensor] = None,
+    use_cuda_kernel: Optional[bool] = True,
+    high_precision: bool = False,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    hidden_states: Optional[torch.FloatTensor] = None,
+    stage_manager: Optional[PipelineStageManager] = None,
+    stage_index: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """This function will replace the forward function of LlamaModel.
+
+    Args:
+        batch (BatchInfo, optional): It stores the necessary input information for this inference.. Defaults to None.
+        k_caches (List[torch.Tensor], optional): It holds the GPU memory for the key cache. Defaults to None.
+        v_caches (List[torch.Tensor], optional): It holds the GPU memory for the value cache. Defaults to None.
+        high_precision(Optional[bool]): Whether to use float32 for underlying calculations of float16 data to achieve higher precision, defaults to False.
+    """
+    block_tables = inputmetadata.block_tables
+    sequence_lengths = inputmetadata.sequence_lengths
+    kv_seq_len = inputmetadata.kv_seq_len
+
+    # NOTE (yuanheng-zhao): fow now, only triton kernels support verification process
+    # during speculative-decoding (`q_len > 1`)
+    # We will expicitly disable `use_cuda_kernel` here when speculative-decoding is enabled
+    if inputmetadata.use_spec_dec and use_cuda_kernel:
+        use_cuda_kernel = False
+        logger.warning("CUDA kernel is disabled for speculative-decoding.")
+
+    # retrieve input_ids and inputs_embeds
+    if stage_manager.is_first_stage():
+        if input_tokens_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_tokens_ids is not None:
+            batch_size, seq_length = input_tokens_ids.shape[:2]
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape[:2]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        device = input_tokens_ids.device if input_tokens_ids is not None else inputs_embeds.device
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_tokens_ids)
+
+        hidden_states = inputs_embeds
+    else:
+        input_shape = hidden_states.shape[:-1]
+        batch_size, seq_length = input_shape
+        device = hidden_states.device
+        
+    # hidden_states = self.embed_tokens(input_tokens_ids)
+
+    cu_seqlens = None
+
+    # NOTE (yuanheng-zhao): we do not use cuda kernels for speculative-decoding for now
+    if inputmetadata.use_spec_dec:
+        # For speculative-decoding Prefill and Verifying Stage
+        if inputmetadata.is_prompts:
+            # output tensor shape is the same as normal Prefill Stage
+            rotary_indexes = [torch.arange(0, length) for length in sequence_lengths]
+        else:
+            # the number of tokens to be verified in parallel plus the correct token in the last step
+            n_tokens = inputmetadata.num_tokens_to_verify + 1
+            assert n_tokens == hidden_states.size(0)
+            rotary_indexes = [(length - n_tokens + i).view(-1) for i in range(n_tokens) for length in sequence_lengths]
+        rotary_indexes = torch.cat(rotary_indexes, dim=-1)
+        cos_sin = (self._cos_cached[rotary_indexes], self._sin_cached[rotary_indexes])
+
+    elif use_cuda_kernel:
+        if can_use_flash_attn2(inputmetadata.dtype):
+            cu_seqlens = F.pad(torch.cumsum(sequence_lengths, dim=0, dtype=torch.int32), (1, 0))
+
+        hidden_dim = self._cos_cached.size(-1)
+        total_length = hidden_states.size(0)
+        cos = torch.empty((total_length, hidden_dim), dtype=self._cos_cached.dtype, device=self._cos_cached.device)
+        sin = torch.empty((total_length, hidden_dim), dtype=self._sin_cached.dtype, device=self._sin_cached.device)
+        inference_ops.get_cos_and_sin(
+            self._cos_cached, self._sin_cached, cos, sin, sequence_lengths, kv_seq_len, inputmetadata.is_prompts
+        )
+        cos_sin = (cos, sin)
+    else:
+        cos_sin = get_xine_cache(sequence_lengths, self._cos_cached, self._sin_cached, inputmetadata.is_prompts)
+
+    sm_scale = 1.0 / (inputmetadata.head_dim**0.5)
+
+    norm_output = torch.empty_like(hidden_states)
+    tokens_to_verify = inputmetadata.num_tokens_to_verify if inputmetadata.use_spec_dec else None
+    residual = None
+
+    for layer_id, decoder_layer in enumerate(self.layers):
+        hidden_states, residual = decoder_layer(
+            hidden_states,
+            residual=residual,
+            block_tables=block_tables,
+            k_cache=k_caches[layer_id],
+            v_cache=v_caches[layer_id],
+            is_prompts=inputmetadata.is_prompts,
+            is_verifier=inputmetadata.use_spec_dec,
+            tokens_to_verify=tokens_to_verify,
+            sequence_lengths=sequence_lengths,
+            cos_sin=cos_sin,
+            fd_inter_tensor=inputmetadata.fd_inter_tensor,
+            kv_seq_len=kv_seq_len,
+            output_tensor=output_tensor,
+            norm_output=norm_output,
+            sm_scale=sm_scale,
+            use_cuda_kernel=use_cuda_kernel,
+            cu_seqlens=cu_seqlens,
+            high_precision=high_precision,
+        )
+
+    if inputmetadata.is_prompts:
+        seq_len_cumsum = sequence_lengths.cumsum(dim=0)
+        hidden_states = hidden_states[seq_len_cumsum - 1].contiguous()
+        residual = residual[seq_len_cumsum - 1].contiguous()
+        norm_output = torch.empty_like(hidden_states)
+    
+    if stage_manager.is_last_stage():
+        hidden_states, _  = self.norm(hidden_states, norm_output, residual, use_cuda_kernel)
+        return hidden_states
+    return {"hidden_states": hidden_states}
+
+
+def llama_causal_lm_forward_pp(
+    self: LlamaForCausalLM,
+    input_tokens_ids: torch.Tensor,
+    output_tensor: torch.Tensor,
+    inputmetadata: InputMetaData,
+    k_caches: List[torch.Tensor] = None,
+    v_caches: List[torch.Tensor] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    hidden_states: Optional[torch.FloatTensor] = None,
+    stage_manager: Optional[PipelineStageManager] = None,
+    stage_index: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """This function will replace the forward function of LlamaForCausalLM.
+
+    Args:
+        batch (BatchInfo): It stores the necessary input information for this inference.
+        k_caches (List[torch.Tensor]): It holds the GPU memory for the key cache.
+        v_caches (List[torch.Tensor]): It holds the GPU memory for the value cache.
+        high_precision(Optional[bool]): Whether to use float32 for underlying calculations of float16 data to achieve higher precision, defaults to False.
+    """
+
+    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    hidden_states = llama_model_forward_pp(
+        self.model,
+        input_tokens_ids=input_tokens_ids,
+        output_tensor=output_tensor,
+        inputmetadata=inputmetadata,
+        k_caches=k_caches,
+        v_caches=v_caches,
+        use_cuda_kernel=inputmetadata.use_cuda_kernel,  # Note currently the cuda kernel of layernorm, rotary_embedding_and_cache_copy couldn't pass the unitest but triton kernel could
+        high_precision=inputmetadata.high_precision,
+        inputs_embeds=inputs_embeds,
+        hidden_states=hidden_states,
+        stage_manager=stage_manager,
+        stage_index=stage_index
+    )
+
+    if stage_manager.is_last_stage():
+        logits = self.lm_head(hidden_states)
+        return logits
+    else:
+        return {"hidden_states": hidden_states}
+
+
 def llama_decoder_layer_forward(
     self: LlamaDecoderLayer,
     hidden_states: torch.Tensor,
@@ -243,6 +414,7 @@ def llama_rmsnorm_forward(
     residual: torch.Tensor = None,
     use_cuda_kernel: bool = True,
 ):
+    
     if use_cuda_kernel:
         if residual is not None:
             inference_ops.fused_add_rms_layernorm(hidden_states, residual, self.weight.data, self.variance_epsilon)

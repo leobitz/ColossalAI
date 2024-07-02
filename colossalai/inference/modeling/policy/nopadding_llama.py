@@ -8,6 +8,8 @@ from colossalai.inference.modeling.models.nopadding_llama import (
     llama_decoder_layer_forward,
     llama_model_forward,
     llama_rmsnorm_forward,
+    llama_model_forward_pp,
+    llama_causal_lm_forward_pp
 )
 from colossalai.inference.utils import init_to_get_rotary
 from colossalai.shardformer.layer import Linear1D_Col, Linear1D_Row
@@ -89,10 +91,10 @@ class NoPaddingLlamaModelInferPolicy(LlamaForCausalLMPolicy, RPC_PARAM):
 
         # self.shard_config._infer()
         self.append_or_create_method_replacement(
-            description={"forward": llama_causal_lm_forward}, policy=policy, target_key=LlamaForCausalLM
+            description={"forward": llama_causal_lm_forward_pp}, policy=policy, target_key=LlamaForCausalLM
         )
         self.append_or_create_method_replacement(
-            description={"forward": llama_model_forward}, policy=policy, target_key=LlamaModel
+            description={"forward": llama_model_forward_pp}, policy=policy, target_key=LlamaModel
         )
         self.append_or_create_method_replacement(
             description={"forward": llama_decoder_layer_forward}, policy=policy, target_key=LlamaDecoderLayer
