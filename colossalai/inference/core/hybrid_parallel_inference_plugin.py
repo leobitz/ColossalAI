@@ -20,7 +20,7 @@ from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-
+from colossalai.inference.utils import get_model_size
 from colossalai.accelerator import get_accelerator
 from colossalai.amp.naive_amp.mixed_precision_optimizer import MixedPrecisionOptimizer
 from colossalai.checkpoint_io import CheckpointIO, HybridParallelCheckpointIO
@@ -36,6 +36,7 @@ from colossalai.shardformer.policies.base_policy import Policy
 from colossalai.tensor.d_tensor.api import is_distributed_tensor
 from colossalai.zero.low_level import LowLevelZeroOptimizer
 from colossalai.booster.plugin.pp_plugin_base import PipelinePluginBase
+import sys
 
 SUPPORT_SP_MODE = ["split_gather", "ring", "all_to_all"]
 
@@ -57,8 +58,8 @@ class HybridParallelInferenceModule(ModelWrapper, AMPModelMixin):
         dp_group: ProcessGroup,
         tp_group: ProcessGroup,
         sp_group: ProcessGroup,
-        use_ddp: bool,
-        ddp_config: dict,
+        # use_ddp: bool,
+        # ddp_config: dict,
         custom_policy: Policy,
     ) -> None:
         self.stage_manager = shard_config.pipeline_stage_manager
@@ -66,15 +67,32 @@ class HybridParallelInferenceModule(ModelWrapper, AMPModelMixin):
         self.dp_group = dp_group
         self.tp_group = tp_group
         self.sp_group = sp_group
-        self.use_dpp = use_ddp
-        self.require_grad_sync = True
+        # self.use_dpp = use_ddp
+        # self.require_grad_sync = False
         # print("======= custom_policy =========== ", custom_policy)
+        # shard_config.pipeline_stage_manager = None
+        torch.cuda.empty_cache()
+        init_gpu_memory = torch.cuda.mem_get_info()[0]
         shardformer = ShardFormer(shard_config)
         if custom_policy is not None:
             assert isinstance(custom_policy, object)
+        
+        # memory_usage_bytes = sum(sys.getsizeof(param.storage()) for param in module.parameters())
+        # memory_usage_gb = memory_usage_bytes / (1024 ** 3)
+        # print(get_model_size(module), "GB---", type(module))
         module, self.shared_params = shardformer.optimize(module, policy=custom_policy)
-
+        self.device = get_accelerator().get_current_device()
+        # print("the device is ", self.device)
+        # if self.verbose:
+        #     self.logger.info(f"the device is {self.device}")
+        wrapper  = ModelWrapper(module).to(self.device)
+        # print(get_model_size(module), "GB---", type(wrapper))
         # setting process groups for shared parameters
+        free_gpu_memory, _ = torch.cuda.mem_get_info()
+        # print("init gpu memory is ", init_gpu_memory / (1024 ** 3), "free gpu memory is ", free_gpu_memory / (1024 ** 3))
+        peak_memory = init_gpu_memory - free_gpu_memory
+        # print(f"Rank [{dist.get_rank()}], Model Weight Max Occupy {peak_memory / (1024 ** 3)} GB, Model size: {get_model_size(module)} GB")
+        module = wrapper
         self.shared_param_process_groups = []
         for shared_param in self.shared_params:
             if len(shared_param) > 0:
@@ -97,12 +115,12 @@ class HybridParallelInferenceModule(ModelWrapper, AMPModelMixin):
         if self.mixed_precision is not None:
             self.convert_fn = partial(_convert_floating_point, dtype=self.mixed_precision)
 
-        # setting ddp configs
-        if use_ddp:
-            # convert model to sync bn
-            module = SyncBatchNorm.convert_sync_batchnorm(module, dp_group)
-            # wrap the model with PyTorch DDP
-            module = DDP(module, process_group=dp_group, **ddp_config)
+        # # setting ddp configs
+        # if use_ddp:
+        #     # convert model to sync bn
+        #     module = SyncBatchNorm.convert_sync_batchnorm(module, dp_group)
+        #     # wrap the model with PyTorch DDP
+        #     module = DDP(module, process_group=dp_group, **ddp_config)
 
         super().__init__(module)
 
@@ -398,73 +416,73 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
         self.enable_flash_attention = enable_flash_attention
         self.enable_jit_fused = enable_jit_fused
         self.enable_sequence_parallelism = enable_sequence_parallelism
-        if dp_outside:
-            (
-                self.dp_axis,
-                self.pp_axis,
-                self.tp_axis,
-                self.sp_axis,
-            ) = (
-                0,
-                1,
-                2,
-                3,
-            )
-            self.pg_mesh = ProcessGroupMesh(self.dp_size, self.pp_size, self.tp_size, self.sp_size)
-        else:
-            self.pp_axis, self.dp_axis, self.tp_axis, self.sp_axis = 0, 1, 2, 3
-            self.pg_mesh = ProcessGroupMesh(self.pp_size, self.dp_size, self.tp_size, self.sp_size)
+        # if dp_outside:
+        #     (
+        #         self.tp_axis,
+        #         self.pp_axis,
+        #         # self.dp_axis,
+        #         # self.sp_axis,
+        #     ) = (
+        #         0,
+        #         1,
+        #         # 2,
+        #         # 3,
+        #     )
+        #     self.pg_mesh = ProcessGroupMesh(self.pp_size, self.tp_size)
+        # else:
+        self.pp_axis, self.tp_axis, self.dp_axis, self.sp_axis = 0, 1, 2, 3
+        self.pg_mesh = ProcessGroupMesh(self.pp_size, self.tp_size, self.dp_size, self.sp_size)
 
         self.stage_manager = None
         self.schedule: OneForwardOneBackwardSchedule = None
         self.custom_policy = custom_policy
-        assert zero_stage in (0, 1, 2)
-        if self.pp_size > 1:
-            assert pp_style in ["1f1b", "interleaved"], "Unsupported pipeline parallelism style"
-            assert pp_style == "interleaved" or num_model_chunks == 1, "num_model_chunks must be 1 when using 1f1b"
-            assert (
-                num_microbatches is not None or microbatch_size is not None
-            ), "num_microbatches or microbatch_size must be specified when using pipeline parallelism"
-            assert self.zero_stage <= 1, "zero stage must be 0 or 1 when using pipeline parallelism"
-            self.stage_manager = PipelineStageManager(
-                self.pg_mesh,
-                pipeline_axis=self.pp_axis,
-                enable_interleave=pp_style == "interleaved",
-                num_model_chunks=num_model_chunks,
-                num_layers_per_stage=num_layers_per_stage,
+        # assert zero_stage in (0, 1, 2)
+        # if self.pp_size > 1:
+        # assert pp_style in ["1f1b", "interleaved"], "Unsupported pipeline parallelism style"
+        assert pp_style == "interleaved" or num_model_chunks == 1, "num_model_chunks must be 1 when using 1f1b"
+        assert (
+            num_microbatches is not None or microbatch_size is not None
+        ), "num_microbatches or microbatch_size must be specified when using pipeline parallelism"
+        # assert self.zero_stage <= 1, "zero stage must be 0 or 1 when using pipeline parallelism"
+        self.stage_manager = PipelineStageManager(
+            self.pg_mesh,
+            pipeline_axis=self.pp_axis,
+            enable_interleave=pp_style == "interleaved",
+            num_model_chunks=num_model_chunks,
+            num_layers_per_stage=num_layers_per_stage,
+        )
+        
+        if pp_style == "interleaved":
+            # assert num_model_chunks > 1, "number of model chunks must be > 1 when using interleaved"
+            # self.schedule = InterleavedSchedule(
+            #     stage_manager=self.stage_manager,
+            #     num_model_chunks=num_model_chunks,
+            #     num_microbatch=num_microbatches,
+            #     microbatch_size=microbatch_size,
+            #     enable_metadata_cache=enable_metadata_cache,
+            # )
+            pass
+        elif pp_style == "1f1b":
+            self.schedule = OneForwardOneBackwardSchedule(
+                stage_manager=self.stage_manager,
+                num_microbatches=num_microbatches,
+                microbatch_size=microbatch_size,
+                enable_metadata_cache=enable_metadata_cache,
             )
-            
-            if pp_style == "interleaved":
-                # assert num_model_chunks > 1, "number of model chunks must be > 1 when using interleaved"
-                # self.schedule = InterleavedSchedule(
-                #     stage_manager=self.stage_manager,
-                #     num_model_chunks=num_model_chunks,
-                #     num_microbatch=num_microbatches,
-                #     microbatch_size=microbatch_size,
-                #     enable_metadata_cache=enable_metadata_cache,
-                # )
-                pass
-            elif pp_style == "1f1b":
-                self.schedule = OneForwardOneBackwardSchedule(
-                    stage_manager=self.stage_manager,
-                    num_microbatches=num_microbatches,
-                    microbatch_size=microbatch_size,
-                    enable_metadata_cache=enable_metadata_cache,
-                )
-            else:
-                raise NotImplementedError()
+        else:
+            raise NotImplementedError()
 
         self.tp_group = self.pg_mesh.get_group_along_axis(self.tp_axis)
         self.dp_group = self.pg_mesh.get_group_along_axis(self.dp_axis)
         self.pp_group = self.pg_mesh.get_group_along_axis(self.pp_axis)
-        if self.enable_sequence_parallelism and self.sequence_parallelism_mode in ["split_gather", "ring"]:
-            self.sp_group = self.pg_mesh.get_group_along_axis(self.tp_axis)
-        else:
-            self.sp_group = self.pg_mesh.get_group_along_axis(self.sp_axis)
+        # if self.enable_sequence_parallelism and self.sequence_parallelism_mode in ["split_gather", "ring"]:
+        #     self.sp_group = self.pg_mesh.get_group_along_axis(self.tp_axis)
+        # else:
+        self.sp_group = self.pg_mesh.get_group_along_axis(self.sp_axis)
 
         self.shard_config = ShardConfig(
             tensor_parallel_process_group=self.tp_group,
-            sequence_parallel_process_group=self.sp_group,
+            # sequence_parallel_process_group=self.sp_group,
             pipeline_stage_manager=self.stage_manager,
             enable_tensor_parallelism=self.tp_size > 1,
             enable_all_optimization=self.enable_all_optimization,
@@ -472,42 +490,44 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
             enable_flash_attention=self.enable_flash_attention,
             enable_jit_fused=self.enable_jit_fused,
             enable_sequence_parallelism=enable_sequence_parallelism,
-            sequence_parallelism_mode=sequence_parallelism_mode,
-            enable_sequence_overlap=enable_sequence_overlap,
-            parallel_output=parallel_output,
-            make_vocab_size_divisible_by=make_vocab_size_divisible_by,
-            gradient_checkpoint_config=gradient_checkpoint_config,
+            
+            # sequence_parallelism_mode=sequence_parallelism_mode,
+            # enable_sequence_overlap=enable_sequence_overlap,
+            # parallel_output=parallel_output,
+            # make_vocab_size_divisible_by=make_vocab_size_divisible_by,
+            # gradient_checkpoint_config=gradient_checkpoint_config,
             extra_kwargs=sharding_extra_kwargs,
         )
+
         if self.custom_policy is not None:
             self.custom_policy.set_shard_config(self.shard_config)
-        self.amp_config = dict(
-            initial_scale=initial_scale,
-            growth_factor=growth_factor,
-            backoff_factor=backoff_factor,
-            growth_interval=growth_interval,
-            hysteresis=hysteresis,
-            min_scale=min_scale,
-            max_scale=max_scale,
-        )
+        # self.amp_config = dict(
+        #     initial_scale=initial_scale,
+        #     growth_factor=growth_factor,
+        #     backoff_factor=backoff_factor,
+        #     growth_interval=growth_interval,
+        #     hysteresis=hysteresis,
+        #     min_scale=min_scale,
+        #     max_scale=max_scale,
+        # )
 
-        self.ddp_config = dict(
-            broadcast_buffers=broadcast_buffers,
-            bucket_cap_mb=ddp_bucket_cap_mb,
-            find_unused_parameters=find_unused_parameters,
-            check_reduction=check_reduction,
-            gradient_as_bucket_view=gradient_as_bucket_view,
-            static_graph=static_graph,
-        )
+        # self.ddp_config = dict(
+        #     broadcast_buffers=broadcast_buffers,
+        #     bucket_cap_mb=ddp_bucket_cap_mb,
+        #     find_unused_parameters=find_unused_parameters,
+        #     check_reduction=check_reduction,
+        #     gradient_as_bucket_view=gradient_as_bucket_view,
+        #     static_graph=static_graph,
+        # )
 
-        self.zero_config = dict(
-            reduce_bucket_size=zero_bucket_size_in_m * 1024 * 1024,
-            communication_dtype=communication_dtype,
-            overlap_communication=overlap_communication,
-            cpu_offload=cpu_offload,
-            partition_grad=(self.zero_stage == 2),
-            forced_dtype=PRECISION_TORCH_TYPE[precision],
-        )
+        # self.zero_config = dict(
+        #     reduce_bucket_size=zero_bucket_size_in_m * 1024 * 1024,
+        #     communication_dtype=communication_dtype,
+        #     overlap_communication=overlap_communication,
+        #     cpu_offload=cpu_offload,
+        #     partition_grad=(self.zero_stage == 2),
+        #     forced_dtype=PRECISION_TORCH_TYPE[precision],
+        # )
 
         self.max_norm = max_norm
 
@@ -548,31 +568,31 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
         dataloader: Optional[DataLoader] = None,
         lr_scheduler: Optional[LRScheduler] = None
     ) -> Tuple[Module, OptimizerWrapper, Callable, DataLoader, LRScheduler]:
-        param_info = get_param_info(optimizer)
+        # param_info = get_param_info(optimizer)
 
         # TODO: Support Galore + ZeRO
-        zero_stage = self.zero_stage
-        zero_config = deepcopy(self.zero_config)
+        # zero_stage = self.zero_stage
+        # zero_config = deepcopy(self.zero_config)
 
         # Replace with distributed implementation if exists
-        optimizer = cast_to_distributed(optimizer)
+        # optimizer = cast_to_distributed(optimizer)
 
-        if isinstance(optimizer, DistGaloreAwamW) and zero_stage > 0 and self.dp_size > 0:
-            warnings.warn("Galore is only supported for Tensor Parallel and vanilla Data Parallel yet. Disabling ZeRO.")
-            zero_config["partition_grad"] = False
-            zero_stage = 0
+        # if isinstance(optimizer, DistGaloreAwamW) and zero_stage > 0 and self.dp_size > 0:
+        #     warnings.warn("Galore is only supported for Tensor Parallel and vanilla Data Parallel yet. Disabling ZeRO.")
+        #     # zero_config["partition_grad"] = False
+        #     zero_stage = 0
 
         if not isinstance(model, ModelWrapper):
-            use_ddp = (self.dp_size > 1 and self.pp_size == 1 and self.zero_stage == 0) or (
-                self.dp_size == 1
-                and self.pp_size == 1
-                and self.enable_sequence_parallelism
-                and self.sequence_parallelism_mode == "all_to_all"
-            )
-            if self.enable_sequence_parallelism and self.sequence_parallelism_mode == "all_to_all":
-                dp_group = self.pg_mesh.create_group_along_axis([self.dp_axis, self.sp_axis])
-            else:
-                dp_group = self.dp_group
+            # use_ddp = (self.dp_size > 1 and self.pp_size == 1 and self.zero_stage == 0) or (
+            #     self.dp_size == 1
+            #     and self.pp_size == 1
+            #     and self.enable_sequence_parallelism
+            #     and self.sequence_parallelism_mode == "all_to_all"
+            # )
+            # if self.enable_sequence_parallelism and self.sequence_parallelism_mode == "all_to_all":
+            #     dp_group = self.pg_mesh.create_group_along_axis([self.dp_axis, self.sp_axis])
+            # else:
+            dp_group = self.dp_group
             model = HybridParallelInferenceModule(
                 model,
                 precision=self.precision,
@@ -580,8 +600,8 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
                 dp_group=dp_group,
                 tp_group=self.tp_group,
                 sp_group=self.sp_group,
-                use_ddp=use_ddp,
-                ddp_config=self.ddp_config,
+                # use_ddp=use_ddp,
+                # ddp_config=self.ddp_config,
                 custom_policy=self.custom_policy,
             )
        
@@ -598,7 +618,7 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
         return_loss: bool = False,
         return_outputs: bool = False,
     ) -> dict:
-        assert self.enable_pipeline_parallelism, "pipeline parallelism is not enabled"
+        # assert self.enable_pipeline_parallelism, "pipeline parallelism is not enabled"
 
         if return_outputs:
             warnings.warn("return_outputs may lead to significant extra memory consumption.")
@@ -611,15 +631,18 @@ class HybridParallelInferencePlugin(PipelinePluginBase):
 
         # with ctx:
         with torch.no_grad():
+            # print("======= input_object =========== ", input_object['input_tokens_ids'].shape)
             outputs = self.schedule.forward_backward_step(
                 model, input_object, criterion, None, return_loss, return_outputs
             )
+            # print("======= outputs =========== ", outputs)
+            
 
         # run with gradients accumulation
         # if model.require_grad_sync == False or (
         #     isinstance(optimizer, HybridParallelZeroOptimizer) and optimizer._grad_store.require_grad_sync == False
         # ):
-        return outputs
+            return outputs
 
         # # Synchronize the grads of shared parameters of the model.
         # model.sync_shared_params()

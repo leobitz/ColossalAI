@@ -15,6 +15,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaModel,
     LlamaRMSNorm,
 )
+from torch import distributed as dist
 
 from colossalai.inference.config import InputMetaData, ModelShardInferenceConfig
 from colossalai.inference.flash_decoding_utils import FDIntermTensors
@@ -176,8 +177,10 @@ def llama_model_forward_pp(
     use_cuda_kernel: Optional[bool] = True,
     high_precision: bool = False,
     hidden_states: Optional[torch.FloatTensor] = None,
+    residual: Optional[torch.FloatTensor] = None,
     stage_manager: Optional[PipelineStageManager] = None,
     stage_index: Optional[List[int]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
 ) -> torch.Tensor:
     """This function will replace the forward function of LlamaModel.
 
@@ -187,10 +190,14 @@ def llama_model_forward_pp(
         v_caches (List[torch.Tensor], optional): It holds the GPU memory for the value cache. Defaults to None.
         high_precision(Optional[bool]): Whether to use float32 for underlying calculations of float16 data to achieve higher precision, defaults to False.
     """
-    block_tables = inputmetadata.block_tables
+    high_precision = False
+    # print("before", stage_manager.stage, input_tokens_ids.shape)
+    # print("start llama_model_forward_pp ", input_tokens_ids.shape, output_tensor.shape)
+    block_tables = inputmetadata.block_tables#.clone().long()
+    
     sequence_lengths = inputmetadata.sequence_lengths
     kv_seq_len = inputmetadata.kv_seq_len
-
+    # print("Sequence lengths", sequence_lengths)
     # NOTE (yuanheng-zhao): fow now, only triton kernels support verification process
     # during speculative-decoding (`q_len > 1`)
     # We will expicitly disable `use_cuda_kernel` here when speculative-decoding is enabled
@@ -201,15 +208,15 @@ def llama_model_forward_pp(
     # retrieve input_ids and inputs_embeds
     if stage_manager.is_first_stage():
         inputs_embeds = self.embed_tokens(input_tokens_ids)
-
+        # print("inputs_embeds", inputs_embeds.mean().item())
         hidden_states = inputs_embeds
-    else:
-        input_shape = hidden_states.shape[:-1]
-        
+    # print("hidden_states in the beginning", hidden_states.shape)
     # hidden_states = self.embed_tokens(input_tokens_ids)
-
+    # print("hidden_states in the middle", hidden_states.shape)
     cu_seqlens = None
-
+    # print("before", stage_manager.stage, hidden_states.shape)
+    
+    # if cos_sin is None:
     # NOTE (yuanheng-zhao): we do not use cuda kernels for speculative-decoding for now
     if inputmetadata.use_spec_dec:
         # For speculative-decoding Prefill and Verifying Stage
@@ -223,7 +230,6 @@ def llama_model_forward_pp(
             rotary_indexes = [(length - n_tokens + i).view(-1) for i in range(n_tokens) for length in sequence_lengths]
         rotary_indexes = torch.cat(rotary_indexes, dim=-1)
         cos_sin = (self._cos_cached[rotary_indexes], self._sin_cached[rotary_indexes])
-
     elif use_cuda_kernel:
         if can_use_flash_attn2(inputmetadata.dtype):
             cu_seqlens = F.pad(torch.cumsum(sequence_lengths, dim=0, dtype=torch.int32), (1, 0))
@@ -240,12 +246,28 @@ def llama_model_forward_pp(
         cos_sin = get_xine_cache(sequence_lengths, self._cos_cached, self._sin_cached, inputmetadata.is_prompts)
 
     sm_scale = 1.0 / (inputmetadata.head_dim**0.5)
-
+    
     norm_output = torch.empty_like(hidden_states)
     tokens_to_verify = inputmetadata.num_tokens_to_verify if inputmetadata.use_spec_dec else None
-    residual = None
+    
+    layers_per_stage = stage_manager.distribute_layers(len(self.layers))
+    stage_index = stage_manager.get_stage_index(layers_per_stage)
     start_idx, end_idx = stage_index[0], stage_index[1]
+    # print("hidden_states in the beginning", hidden_states.shape, start_idx, end_idx)
+    # print("== stage_manager.stage == v ", stage_manager.stage, [kc.mean().item() for kc in v_caches[start_idx:end_idx]])
+    # print("== stage_manager.stage == k ", [kc.device for kc in k_caches[start_idx:end_idx]])
+    # if stage_manager.is_first_stage():
+    #     print([kc.mean().item() for kc in k_caches])
+    #     print([kc.mean().item() for kc in v_caches])
+    # if stage_manager.is_first_stage():
+    #     print("input_embed", hidden_states.mean().item())
+    # hiddens = []
+    # print("block_tables ", block_tables)
+    # copy_block_tables = block_tables.clone().cpu().numpy()
+    # create a  tensor from numpy on device
+    # block_tables = torch.from_numpy(copy_block_tables).to(block_tables.device)
     for layer_id, decoder_layer in enumerate(self.layers[start_idx:end_idx], start=start_idx):
+        # print("-->", hidden_states.pow(2).sqrt().mean().item())
         hidden_states, residual = decoder_layer(
             hidden_states,
             residual=residual,
@@ -266,17 +288,46 @@ def llama_model_forward_pp(
             cu_seqlens=cu_seqlens,
             high_precision=high_precision,
         )
-
-    if inputmetadata.is_prompts:
-        seq_len_cumsum = sequence_lengths.cumsum(dim=0)
-        hidden_states = hidden_states[seq_len_cumsum - 1].contiguous()
-        residual = residual[seq_len_cumsum - 1].contiguous()
-        norm_output = torch.empty_like(hidden_states)
+        # mean = torch.mean(hidden_states.pow(2).sqrt())
+        # print(layer_id, "hidden_states", mean.item())
+        # print(inputmetadata.block_tables.clone())
+        # print(layer_id, "copy_block_tables", copy_block_tables)
+        # hiddens.append(hidden_states)
     
+    # print("hiddens ", stage_manager.stage, [h.mean().item() for h in hiddens])
+        # print(layer_id, " v_caches ", k_caches[layer_id].mean())
+    # print("==> stage_manager.stage", [kc.mean().item() for kc in k_caches[start_idx:end_idx]]) 
+    # print(type(self.norm), (self.norm.weight == None), stage_manager.is_last_stage())
+    # print("hidden_states in the middle", hidden_states.shape)
+    # if stage_manager.is_first_stage():
+    #     print("==> ", [kc.mean().item() for kc in k_caches])
+    #     print("==> ", [kc.mean().item() for kc in v_caches])
+    # print(layer_id, "hidden_states", mean.item())
     if stage_manager.is_last_stage():
-        hidden_states, _  = self.norm(hidden_states, norm_output, residual, use_cuda_kernel)
+        # print("++++++++++++")
+        # print([kc.mean().item() for kc in k_caches])
+        # print([kc.mean().item() for kc in v_caches])
+        if inputmetadata.is_prompts:
+            seq_len_cumsum = sequence_lengths.cumsum(dim=0)
+            # print("seq_len_cumsum", seq_len_cumsum, hidden_states.shape, seq_len_cumsum - 1)
+            # rank = dist.get_rank()
+            # if rank == 3:
+            #     print("seq_len_cumsum", seq_len_cumsum, hidden_states.shape, seq_len_cumsum - 1)
+            hidden_states = hidden_states[seq_len_cumsum - 1].contiguous()
+            # print("seq_len_cumsum", seq_len_cumsum, hidden_states.shape, seq_len_cumsum - 1)
+            residual = residual[seq_len_cumsum - 1].contiguous()
+            norm_output = torch.empty_like(hidden_states)
+            # print("hidden_states in the end", hidden_states.shape)
+            # print("hidden_states in the end", hidden_states.shape, norm_output.shape)
+        # hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, norm_output, residual, use_cuda_kernel)
+        # print("last hidden_states in the end", hidden_states.shape)
         return hidden_states
-    return {"hidden_states": hidden_states}
+    # print("==> stage_manager.stage", [kc.mean().item() for kc in k_caches[start_idx:end_idx]])
+    # print("==> ", stage_manager.stage, [kc.mean().item() for kc in v_caches[start_idx:end_idx]])
+    
+    return {"hidden_states": hidden_states,
+             'residual': residual}
 
 
 def llama_causal_lm_forward_pp(
@@ -288,6 +339,7 @@ def llama_causal_lm_forward_pp(
     v_caches: List[torch.Tensor] = None,
     inputs_embeds: Optional[torch.FloatTensor] = None,
     hidden_states: Optional[torch.FloatTensor] = None,
+    residual: Optional[torch.FloatTensor] = None,
     stage_manager: Optional[PipelineStageManager] = None,
     stage_index: Optional[List[int]] = None,
 ) -> torch.Tensor:
@@ -312,15 +364,29 @@ def llama_causal_lm_forward_pp(
         high_precision=inputmetadata.high_precision,
         inputs_embeds=inputs_embeds,
         hidden_states=hidden_states,
+        residual=residual,
         stage_manager=stage_manager,
         stage_index=stage_index
     )
-
+    # mean of hidden states
+    
+    # if type(hidden_states) == dict:
+    #     print(f"hidden_states in causallm dtype {type(hidden_states)}", hidden_states.keys())
+    # else:
+    
+    # print(stage_manager.is_last_stage(), "stage_manager.is_last_stage():")
     if stage_manager.is_last_stage():
+        # print(f"hidden_states in causallm dtype {type(hidden_states)}", hidden_states.shape)
+        # mean = torch.mean(hidden_states.pow(2).sqrt())
+        # print("mean", mean)
+        # print("mean", mean.item())
         logits = self.lm_head(hidden_states)
+        # print("last stage logits", logits.shape)
+        # print(stage_manager.stage, hidden_states.shape)
         return logits
     else:
-        return {"hidden_states": hidden_states}
+        # print("stage_manager.stage", hidden_states["hidden_states"].shape)
+        return hidden_states#{"hidden_states": hidden_states["hidden_states"], 'residual': hidden_states["residual"]}
 
 
 def llama_decoder_layer_forward(
@@ -369,7 +435,7 @@ def llama_decoder_layer_forward(
 
     hidden_states, residual = self.input_layernorm(hidden_states, norm_output, residual, use_cuda_kernel)
     # Self Attention
-    hidden_states = self.self_attn(
+    atten_hidden_states = self.self_attn(
         hidden_states=hidden_states,
         block_tables=block_tables,
         k_cache=k_cache,
@@ -388,7 +454,7 @@ def llama_decoder_layer_forward(
     )
 
     # Fully Connected
-    hidden_states, residual = self.post_attention_layernorm(hidden_states, norm_output, residual, use_cuda_kernel)
+    hidden_states, residual = self.post_attention_layernorm(atten_hidden_states, norm_output, residual, use_cuda_kernel)
     hidden_states = self.mlp(hidden_states)
 
     return hidden_states, residual
@@ -401,7 +467,6 @@ def llama_rmsnorm_forward(
     residual: torch.Tensor = None,
     use_cuda_kernel: bool = True,
 ):
-    
     if use_cuda_kernel:
         if residual is not None:
             inference_ops.fused_add_rms_layernorm(hidden_states, residual, self.weight.data, self.variance_epsilon)
@@ -586,9 +651,10 @@ class NopadLlamaAttention(LlamaAttention, ParallelModule):
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
+        # print(model_shard_infer_config)
         self.attention_backend = get_attention_backend(model_shard_infer_config)
         self.pre_attention_backend = get_pre_attention_backend(model_shard_infer_config)
-
+        # print(type(self.attention_backend), type(self.pre_attention_backend))
         if self.num_heads == self.num_key_value_heads:
             qkv_weight_list = [attn_qproj_w.transpose(0, 1), attn_kproj_w.transpose(0, 1), attn_vproj_w.transpose(0, 1)]
             self.qkv_weight = nn.Parameter(torch.stack(qkv_weight_list, dim=0))
@@ -600,6 +666,7 @@ class NopadLlamaAttention(LlamaAttention, ParallelModule):
                 "k_proj.weight": None,
                 "v_proj.weight": None,
             }  # used and delattr in load/shard of qkv weight
+            # print("q_proj_weight", self.qkv_weight.mean().item())
         else:
             self.helper_layout = (
                 attn_qproj_w.dist_layout
@@ -607,6 +674,7 @@ class NopadLlamaAttention(LlamaAttention, ParallelModule):
             self.q_proj_weight = nn.Parameter(attn_qproj_w.transpose(0, 1).contiguous())
             self.k_proj_weight = nn.Parameter(attn_kproj_w.transpose(0, 1).contiguous())
             self.v_proj_weight = nn.Parameter(attn_vproj_w.transpose(0, 1).contiguous())
+            # print("q_proj_weight", self.q_proj_weight.mean().item(), self.k_proj_weight.mean().item(), self.v_proj_weight.mean().item())
 
     @staticmethod
     def from_native_module(
@@ -696,9 +764,11 @@ class NopadLlamaAttention(LlamaAttention, ParallelModule):
             query_states, key_states, value_states = (
                 torch.bmm(hidden_states, self.qkv_weight).view(3, token_nums, self.num_heads, self.head_dim).unbind(0)
             )
-
+        # print("query_states", self.q_proj_weight.mean().item(), self.k_proj_weight.mean().item(), self.v_proj_weight.mean().item()  )
         block_size = k_cache.size(-2)
-
+        # print(output_tensor.mean().item())
+        # kc = k_cache.clone() * 2
+        # vc = v_cache.clone() * 2
         attn_metadata = AttentionMetaData(
             query_states=query_states,
             key_states=key_states,
@@ -716,35 +786,62 @@ class NopadLlamaAttention(LlamaAttention, ParallelModule):
             use_spec_dec=is_verifier,
             use_alibi_attn=False,
         )
-
+        # print("query_states", token_nums, query_states.mean().item(), key_states.mean().item(), value_states.mean().item())
+        # print(block_tables.float().mean().item(), block_size, kv_seq_len, 
+            #   sequence_lengths.item(), sm_scale, cu_seqlens, output_tensor.mean().item(), is_verifier)
+        # rank = dist.get_rank()   
+        # if rank == 0:     
+        #     print(is_prompts, attn_metadata)
+        # out = output_tensor.mean().item()   
+        # print("cos_sin", high_precision, cos_sin[0].to(torch.bfloat16).pow(2).sqrt().mean().item(), cos_sin[1].to(torch.bfloat16).pow(2).sqrt().mean().item())
         if is_prompts:  # prefilling stage
             self.pre_attention_backend.prefill(
                 attn_metadata,
-                cos=cos_sin[0],
-                sin=cos_sin[1],
+                cos=cos_sin[0].to(torch.bfloat16),
+                sin=cos_sin[1].to(torch.bfloat16),
                 high_precision=high_precision,
             )
+            # k_cache.multiply_(2)
+            # v_cache.multiply_(2)
+            # attn_metadata.k_cache = k_cache.clone() * 2
+            # attn_metadata.v_cache = v_cache.clone() * 2
+            # if rank == 0:
+            #     print("==> ", attn_metadata)
             attn_output = self.attention_backend.prefill(
                 attn_metadata,
                 token_nums=token_nums,
             )
+            # if rank == 0:
+            #     print("+++ ", attn_metadata)
+            # print("attn_output", self.q_proj_weight.mean().item(), self.k_proj_weight.mean().item(), self.v_proj_weight.mean().item(), 
+            #       kc.mean().item(), vc.mean().item(), attn_output.mean().item(), out)
         else:  # decoding stage
+            # attn_metadata.key_states = attn_metadata.key_states * 2
             q_len = tokens_to_verify + 1 if is_verifier else 1
-
+            # print(attn_metadata)
             self.pre_attention_backend.decode(
                 attn_metadata,
-                cos=cos_sin[0],
-                sin=cos_sin[1],
+                cos=cos_sin[0].to(torch.bfloat16),
+                sin=cos_sin[1].to(torch.bfloat16),
                 q_len=q_len,
             )
+            # k_cache.multiply_(2)
+            # v_cache.multiply_(2)
+            # if rank == 0:
+            #     print("==> ", attn_metadata)
+            # attn_metadata.k_cache = k_cache.clone() * 2
+            # attn_metadata.v_cache = v_cache.clone() * 2
             attn_output = self.attention_backend.decode(
                 attn_metadata,
                 fd_inter_tensor=fd_inter_tensor,
                 num_key_value_groups=self.num_key_value_groups,
                 q_len=q_len,
             )
+            # if rank == 0:
+                # print("+++ ", attn_metadata)
 
         attn_output = attn_output.view(-1, self.hidden_size)
+        # print("attn_output", attn_output.mean().item(), self.o_proj.weight.mean().item())
         attn_output = self.o_proj(attn_output)
         return attn_output
 
@@ -833,4 +930,4 @@ class NopadLlamaAttention(LlamaAttention, ParallelModule):
         )
 
     def extra_repr(self) -> str:
-        return f"qkv_weight_proj MergedLinear1D_Col: in_features={self.qkv_weight.shape[1]}x3, out_features={self.qkv_weight.shape[2]}, bias=False"
+        return "qkv_weight_proj MergedLinear1D_Col: in_features={self.qkv_weight.shape[1]}x3, out_features={self.qkv_weight.shape[2]}, bias=False"

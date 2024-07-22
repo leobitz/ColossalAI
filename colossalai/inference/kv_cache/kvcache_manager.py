@@ -88,6 +88,7 @@ class KVCacheManager:
             self.max_blocks_per_sequence = (
                 self.max_input_length + self.max_output_length + self.block_size - 1
             ) // self.block_size
+        # print(self.max_blocks_per_sequence, self.max_batch_size, self.beam_width)
         self.num_blocks = self.max_blocks_per_sequence * self.max_batch_size * self.beam_width
 
         # Physical cache allocation
@@ -95,6 +96,7 @@ class KVCacheManager:
             x = 16 // torch.tensor([], dtype=config.dtype).element_size()
             kalloc_shape = (self.num_blocks, self.kv_head_num, self.head_size // x, self.block_size, x)
             valloc_shape = (self.num_blocks, self.kv_head_num, self.block_size, self.head_size)
+            # print(kalloc_shape, valloc_shape)
             self.logger.info(
                 f"Allocating K cache with shape: {kalloc_shape}, V cache with shape: {valloc_shape} consisting of {self.num_blocks} blocks."
             )
@@ -516,6 +518,8 @@ class KVCacheManager:
         for _ in range(self.num_layers):
             k_cache.append(torch.zeros(kalloc_shape, dtype=self.kv_cache_dtype, device=self.device))
             v_cache.append(torch.zeros(valloc_shape, dtype=self.kv_cache_dtype, device=self.device))
+        
+        k_cache, v_cache = ([kc.clone() for kc in k_cache], [vc.clone() for vc in v_cache])
         return k_cache, v_cache
 
 

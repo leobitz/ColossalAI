@@ -26,6 +26,10 @@ class AttentionMetaData:
     use_spec_dec: bool = False
     use_alibi_attn: bool = False
 
+    def __str__(self) -> str:
+        # if tensor, then print mean().item()
+        return f"AttentionMetaData(query_states={self.query_states.pow(2).sqrt().mean().item()}, key_states={self.key_states.pow(2).sqrt().mean().item()}, value_states={self.value_states.pow(2).sqrt().mean().item()}, k_cache={self.k_cache.pow(2).sqrt().mean().item()}, v_cache={self.v_cache.pow(2).sqrt().mean().item()}, block_tables={self.block_tables.float().pow(2).sqrt().mean().item()}, block_size={self.block_size}, kv_seq_len={self.kv_seq_len}, sequence_lengths={self.sequence_lengths.float().pow(2).sqrt().mean().item()}, sm_scale={self.sm_scale}, output_tensor={self.output_tensor.pow(2).sqrt().mean().item()}, use_spec_dec={self.use_spec_dec}, use_alibi_attn={self.use_alibi_attn})"
+
 
 class AttentionBackend(ABC):
     @abstractmethod

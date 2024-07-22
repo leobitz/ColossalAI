@@ -541,7 +541,7 @@ class BatchBucket:
     # For compatibility
     def get_block_table_tensor(self) -> torch.Tensor:
         assert self.is_compact  # Debug usage
-        block_table = self.block_tables[: self.current_batch_size]
+        block_table = self.block_tables[: self.current_batch_size]#.clone()
         return block_table.to(device=self.device)
 
     # For compatibility

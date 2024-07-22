@@ -325,6 +325,8 @@ class RequestHandler:
         return self.prefill_bb.current_batch_size + self.running_bb.current_batch_size
 
     def append_next_tokens(self, sample_tokens: torch.Tensor):
+        if sample_tokens == None:
+            return
         assert sample_tokens.dim() == 1
         n_elements = sample_tokens.size(0)
         if not self.prefill_bb.is_empty:

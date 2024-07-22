@@ -216,6 +216,7 @@ class LlamaPolicy(Policy):
     def set_pipeline_forward(self, model_cls: nn.Module, new_forward: Callable, policy: Dict) -> None:
         """If under pipeline parallel setting, replacing the original forward method of huggingface
         to customized forward method, and add this changing to policy."""
+        # print("self.pipeline_stage_manager", self.pipeline_stage_manager)
         if self.pipeline_stage_manager is None:
             return
 

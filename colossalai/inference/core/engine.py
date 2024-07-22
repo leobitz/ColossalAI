@@ -168,6 +168,7 @@ class InferenceEngine:
         if self.verbose:
             self.logger.info(f"the device is {self.device}")
 
+        # print("self.dtype", self.dtype)
         model = model.to(self.dtype).eval()
 
         if self.verbose:
@@ -562,7 +563,6 @@ class InferenceEngine:
         Returns:
             Union[List[str], Tuple[List[str], List[List[int]]]]: Inference result returned by one generation.
         """
-
         gen_config_dict = generation_config.to_dict() if generation_config is not None else {}
         prompts = [prompts] if isinstance(prompts, str) else prompts
         request_ids = [request_ids] if isinstance(request_ids, int) else request_ids
@@ -746,7 +746,7 @@ class InferenceEngine:
             use_cuda_graph = True
 
         input_meta_data = InputMetaData(
-            block_tables=batch.get_block_table_tensor(),
+            block_tables=batch.get_block_table_tensor(),#,.clone(),
             sequence_lengths=sequence_lengths,
             fd_inter_tensor=batch.fd_inter_tensor,
             batch_size=batch.current_batch_size,
@@ -780,26 +780,27 @@ class InferenceEngine:
         batch = self.request_handler.schedule()
 
         input_token_ids, output_tensor, input_meta_data = self.prepare_input(batch)
-
+        # print(input_meta_data)
         if input_meta_data.use_cuda_graph:
             model_executable = self.graph_runners[input_meta_data.batch_size]
         else:
             model_executable = self.hybrid_model
 
         batch_input = {
-                        "input_tokens_ids": input_token_ids, 
-                        "output_tensor": output_tensor, 
+                        "input_tokens_ids": input_token_ids.reshape(self.inference_config.micro_batch_size, -1), 
+                        "output_tensor": output_tensor.reshape(self.inference_config.micro_batch_size, -1), 
                         "inputmetadata": input_meta_data,
                         "k_caches": self.k_cache,
                         "v_caches": self.v_cache,
                         "stage_manager": self.hybrid_inference.stage_manager,
-                        "hidden_states": None,
-                        "stage_index": None
                         }
-        outputs = self.hybrid_inference.execute_pipeline(batch_input, self.hybrid_model, None, False, return_outputs=True)
-        print(outputs)
+        # rank = dist.get_rank()
+        # if rank == 0:
+        #     print(input_token_ids.cpu().numpy().flatten().tolist())
+        #     print("kv", [kv.pow(2).sqrt().mean().item() for kv in self.k_cache])
+        logits = self.hybrid_inference.execute_pipeline(batch_input, self.hybrid_model, None, False, return_outputs=True)
         # TODO: padding_id is used for generating attn_mask and will be removed if nopad version is supported.
-        logits = model_executable(input_token_ids, output_tensor, input_meta_data, self.k_cache, self.v_cache)
+        # logits = model_executable(input_token_ids, output_tensor, input_meta_data, self.k_cache, self.v_cache)
         if self.inference_config.pad_input:
             logits = logits[:, -1, :]
 

@@ -5,12 +5,14 @@ import torch
 import torch.cuda
 from torch.nn import Module
 from torch.utils._pytree import tree_map
-
+from torch import distributed as dist
 from colossalai.accelerator import get_accelerator
 from colossalai.interface import ModelWrapper, OptimizerWrapper
 from colossalai.pipeline.p2p import PipelineP2PCommunication, create_send_metadata
 from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.utils import get_current_device
+from torch.utils._pytree import SUPPORTED_NODES, TreeSpec, _register_pytree_node, tree_flatten, tree_map, tree_unflatten
+
 
 from colossalai.pipeline.schedule._utils import (
     detach,
@@ -71,10 +73,13 @@ class OneForwardOneBackwardSchedule(PipelineSchedule):
         if device is not None:
             batch = tree_map(partial(to_device, device=device), batch)
 
+
         self.microbatch_offset = 0
         self.batch = batch
-        self.batch_size = get_batch_size(batch)
-
+        self.batch_size = get_batch_size(batch['input_tokens_ids'])
+        # data_list, _ = tree_flatten(batch)
+        # print([data.shape if isinstance(data, torch.Tensor) else type(data) for data in data_list])
+        # print("Batch size", self.batch_size)
         if self.microbatch_size is None:
             assert self.batch_size % self.num_microbatches == 0, "Batch size should divided by # microbatches"
             self.microbatch_size = self.batch_size // self.num_microbatches
@@ -227,6 +232,7 @@ class OneForwardOneBackwardSchedule(PipelineSchedule):
         self,
         model: Module,
         input_obj: Optional[dict],
+        other_obj: Optional[dict],
         criterion: Callable=None,
         accum_loss: Optional[torch.Tensor] = None,
         outputs: Optional[List[Any]] = None,
@@ -244,23 +250,58 @@ class OneForwardOneBackwardSchedule(PipelineSchedule):
             Union[torch.Tensor, dict]: The intermediate output (dict) of the current stage. If it is the last stage, the output is the loss (Tensor).
         """
         micro_batch = self.load_micro_batch()
+        # print(micro_batch['input_tokens_ids'].shape, self.microbatch_size, self.num_microbatches, self.batch_size)
         # for the first stage, input_obj is None
         # for the non-first stage, input_obj is the output of the previous stage and it's must be a dict
-        out_dict = {}
+        # out_dict = {}
+        # for k, v in micro_batch.items():
+        #     if isinstance(v, torch.Tensor):
+        #         print(f"micro_batch[{k}]: {v.size()}")
+        # print("Before model_forward", self.stage_manager.stage)
+        # print("Microbaching")
+        # print("Micro", [type(item) for item in micro_batch])
+        # if input_obj is not None:
+        #     for item in input_obj:
+        #         if type(item) == dict:
+        #             print(" -> dict -> Input", [(key, type(item[key])) for key in item.keys()])
+        #         elif type(item) == list:
+        #             print(" -> list -> Input", [type(i) for i in item])
+        #         else:
+        #             print(" -> don't know -> Input", type(item))
+        # else:
+        #     print("Input", input_obj)
+        # print("Before slicing", micro_batch['input_tokens_ids'].shape)
+        for key in micro_batch:
+            if key == 'input_tokens_ids':
+                micro_batch['input_tokens_ids'] = micro_batch['input_tokens_ids'].flatten()
+            elif key == 'output_tensor':
+                micro_batch['output_tensor'] = micro_batch['output_tensor'].reshape(-1, micro_batch['output_tensor'].shape[-1])
+        # print(micro_batch.keys())
+        # print(micro_batch['input_tokens_ids'], "micro_batch", self.stage_manager.stage)
+        # micro_batch = tree_map(_get_tensor_slice, micro_batch)
+        # print("After slicing", micro_batch['input_tokens_ids'].shape, self.stage_manager.stage)
+        # print(input_obj, "Input objjj Input objjj")
+        # merge micro_batch with other_obj dicts
+        # print("other dict keys", other_obj.keys())
+        # print("micro_batch keys", micro_batch.keys())
+        # if input_obj is not None:
+        #     print("input_obj keys", input_obj.keys())
+        micro_batch.update(other_obj)
+        # print(micro_batch['inputmetadata'].block_tables)
         output_obj = model_forward(model, micro_batch, input_obj)
-        if self.stage_manager.is_last_stage():
-            if criterion is None:
-                loss = criterion(output_obj, micro_batch) / self.num_microbatches
-                if accum_loss is not None:
-                    accum_loss.add_(loss.detach())
-                out_dict["loss"] = loss
-            if outputs is not None:
-                outputs.append(tree_map_hf(detach, output_obj))
-            logits = output_obj["logits"]
-            out_dict["logits"] = logits
-            return out_dict
-        else:
-            return output_obj
+        # print("output_obj ",type( output_obj), self.stage_manager.stage)
+        # print("After model_forward", self.stage_manager.stage, type(output_obj))
+        # if self.stage_manager.is_last_stage():
+        #     if outputs is not None:
+        #         outputs.append(tree_map_hf(detach, output_obj))
+        #     # if type(output_obj) == dict:
+        #     #     print("output_obj[key].shape", [output_obj[key].shape for key in output_obj.keys()])
+        #     # else:
+        #     #     print("output_obj.shape", output_obj.shape)
+        #     return outputs
+        # else:
+            # print("output_obj[key].shape", [output_obj[key].shape for key in output_obj.keys()])
+        return output_obj
 
     # def backward_step(
     #     self,
@@ -319,24 +360,75 @@ class OneForwardOneBackwardSchedule(PipelineSchedule):
         """
         assert self.forward_only
 
-        self.load_batch(input_obj)
+        input_dict = {"input_tokens_ids": input_obj["input_tokens_ids"], 'output_tensor': input_obj['output_tensor']}
+        other_dict = {key: value for key, value in input_obj.items() if key not in ['input_tokens_ids', 'output_tensor']}
+        # print(other_dict.keys())
+        self.load_batch(input_dict)
 
         accum_loss = None
-        if return_loss and self.stage_manager.is_last_stage():
-            accum_loss = torch.scalar_tensor(0, device=get_accelerator().get_current_device())
-        outputs = [] if return_outputs and self.stage_manager.is_last_stage() else None
-
+        # if return_loss and self.stage_manager.is_last_stage():
+            # accum_loss = torch.scalar_tensor(0, device=get_accelerator().get_current_device())
+        # outputs = [] if return_outputs and self.stage_manager.is_last_stage() else None
+        # print("======= num_microbatches =========== ", self.num_microbatches, [key for key in input_obj.keys()])
         for _ in range(self.num_microbatches):
             input_obj = self.recv_forward()
-            output_obj = self.forward_step(model, input_obj, criterion, accum_loss, outputs)
+            # print("input_obj", "input_obj", self.stage_manager.stage)
+            output_obj = self.forward_step(model, input_obj,  other_dict, None, None, None)
+            # print(f"{_} x-> output_objxx", self.stage_manager.stage, type(output_obj))
             self.send_forward(output_obj)
+            # print(f"{_} x-> output_obj", output_obj.shape)
+        # return output_obj
+            # if type(output_obj) == dict:
+            #     print("======= outputs =========== dict", self.stage_manager.stage, type(output_obj))
+            # elif type(output_obj) == torch.Tensor:
+            #     print("======= outputs =========== tensor", self.stage_manager.stage, output_obj.shape)
+            # else:
+            #     print("======= outputs =========== else", self.stage_manager.stage, type(output_obj))
+        
+        # get number of gpus
+        # num_gpus = dist.get_world_size()
 
-        if outputs is not None:
-            if isinstance(model, ModelWrapper):
-                model = model.unwrap()
-            batch_size_dim = getattr(model, "batch_size_dim", 0)
-            outputs = merge_batch(outputs, batch_size_dim)
-        return {"loss": accum_loss, "outputs": outputs}
+        # if num_gpus > 1:
+        if self.stage_manager.is_last_stage():
+            rank = dist.get_rank()
+            # to_rank = 0 if rank % 2 == 0 else 1
+            # if rank == 2:
+            #     to_rank = 0
+            #     self.comm.send_backward(output_obj, to_rank)
+            # if rank == 3:
+            #     self.comm.send_backward(output_obj, 1)
+            # self.comm.send_backward(output_obj, 2)
+            self.comm.send_backward(output_obj, 0)
+            self.comm.send_backward(output_obj, 1)
+            self.comm.send_backward(output_obj, 2)
+            # print("just sent it", self.stage_manager.stage)
+            return output_obj
+
+            # print("# if rank is 0, then receive the last stage output")
+        if not self.stage_manager.is_last_stage():
+            # print("======= recv_forwardx =========== ", self.stage_manager.stage)
+            # from_rank = 2 if dist.get_rank() == 0 else 3
+            # from_rank = dist.get_world_size() - 1
+            # if dist.get_rank() == 0:
+            #     outputs = self.comm.recv_backward(2)
+            # if dist.get_rank() == 1:
+            #     outputs = self.comm.recv_backward(3)
+            outputs = self.comm.recv_backward(3)
+            # print("just received it", self.stage_manager.stage)
+            # print(type(output_obj),output_obj.keys())
+            return outputs[0]
+            # print("======= recv_forwardy =========== ", self.stage_manager.stage, outputs[0].shape)
+        # logit_from_last_stage = self.recv_forward()
+
+        # if self.stage_manager.is_last_stage():
+        #     return None
+
+        # if outputs is not None:
+        #     if isinstance(model, ModelWrapper):
+        #         model = model.unwrap()
+        #     batch_size_dim = getattr(model, "batch_size_dim", 0)
+        #     outputs = merge_batch(outputs, batch_size_dim)
+        # return {"outputs": outputs}
 
     # def run_forward_backward(
     #     self,
@@ -445,11 +537,14 @@ class OneForwardOneBackwardSchedule(PipelineSchedule):
         Returns:
             dict: Dictionary containing loss and outputs.
         """
-
+        
         self.forward_only = not torch.is_grad_enabled()
         if optimizer is None:
             assert self.forward_only, "Optimizer should be passed when doing backward."
-
+        # print("Forward only ", "stage", self.stage_manager.stage)
+        # if self.stage_manager.is_last_stage():
+        #     rank = dist.get_rank()
+            # print("First stage with rank ", rank)
         result = self.run_forward_only(model, input_obj, criterion, return_loss, return_outputs)
         
         return result

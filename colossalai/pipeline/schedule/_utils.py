@@ -112,13 +112,29 @@ def model_forward(model: Module, data: Any, internal_inputs: Optional[dict]) -> 
     Returns:
         Any: Outputs of the model.
     """
+    # print([key for key in data.keys()])
+    # print("model_forwardx ", type(data), type(internal_inputs),  data['stage_manager'].stage)
+    if type(internal_inputs) == tuple:
+        # print("\n\n")
+        for item in internal_inputs:
+            if type(item) == dict:
+                internal_inputs = item
+                # print("-->>", type(item), [key for key in item.keys()])
+            # elif type(item) == list:
+                # print("-->>", type(item), [type(i) for i in item])
+        # print("\n\n")
+    # print([data[key].shape if type(data[key]) == torch.Tensor else type(data[key]) for key in data.keys()])
     if internal_inputs is None:
         internal_inputs = {}
     if isinstance(data, (list, tuple)):
-        return model(*data, **internal_inputs)
+        out = model(*data, **internal_inputs)
     elif isinstance(data, dict):
-        return model(**data, **internal_inputs)
-    return model(data, **internal_inputs)
+        out = model(**data, **internal_inputs)
+    else:
+        out =  model(data, **internal_inputs)
+    
+    # print("Outttttt ", out.keys())
+    return out
 
 
 def retain_grad(x: Any) -> None:

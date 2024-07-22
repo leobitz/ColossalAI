@@ -147,7 +147,7 @@ class Booster:
             model, optimizer, criterion, dataloader, lr_scheduler = self.plugin.configure(
                 model, optimizer, criterion, dataloader, lr_scheduler
             )
-
+        # print("Configured model, optimizer, criterion, dataloader, lr_scheduler")
         if self.plugin and not self.plugin.control_device():
             # transform model for accelerator
             model = self.accelerator.configure_model(model)
@@ -157,11 +157,11 @@ class Booster:
             # when mixed_precision is specified and the plugin is not given or does not control the precision
             model, optimizer, criterion = self.mixed_precision.configure(model, optimizer, criterion)
 
-        if pretrained_path:
-            self.load_model(model, pretrained_path)
-            # clear pretrained path attr
-            orig_model = model.unwrap() if isinstance(model, ModelWrapper) else model
-            pretrained_utils.set_pretrained_path(orig_model, None)
+        # if pretrained_path:
+        #     self.load_model(model, pretrained_path)
+        #     # clear pretrained path attr
+        #     orig_model = model.unwrap() if isinstance(model, ModelWrapper) else model
+        #     pretrained_utils.set_pretrained_path(orig_model, None)
 
         return model, optimizer, criterion, dataloader, lr_scheduler
 
